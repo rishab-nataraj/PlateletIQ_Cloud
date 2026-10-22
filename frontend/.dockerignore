@@ -1,5 +1,3 @@
 node_modules/
 dist/
-.figma/
-src/imports/*.pdf
-src/imports/*.xlsx
+# Note: .figma/ must stay — vite.config.ts reads .figma/make/site.json.
