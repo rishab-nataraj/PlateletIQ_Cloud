@@ -1,0 +1,72 @@
+# Render Blueprint — infrastructure as code for the PlateletIQ API.
+#
+# Render → New → Blueprint → pick this repository. Render reads this file,
+# creates the web service, generates the three secrets, and asks for the values
+# marked `sync: false`. Optional integrations are listed at the bottom as
+# comments: add them under the service's Environment tab, or let Doppler sync
+# them (docs/DEPLOYMENT.md).
+#
+# The React console is deployed separately on Vercel (frontend/vercel.json).
+
+services:
+  - type: web
+    name: plateletiq-api
+    runtime: python
+    plan: free
+    # Closest Render region to India. Put the Supabase project in Singapore too.
+    region: singapore
+    rootDir: backend
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
+    healthCheckPath: /api/v1/health
+    autoDeploy: true
+    buildFilter:
+      paths:
+        - backend/**
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: APP_ENV
+        value: production
+      - key: LOG_JSON
+        value: "1"
+      - key: ALLOW_DEV_SIGNIN
+        # Set to 1 only for a classroom demo without Google sign-in.
+        value: "0"
+
+      # Generated once by Render and kept stable across deploys.
+      - key: JWT_SECRET
+        generateValue: true
+      - key: OTP_SECRET
+        generateValue: true
+      - key: JOBS_SECRET
+        generateValue: true
+
+      # Asked for when the Blueprint is created.
+      - key: DATABASE_URL
+        sync: false # Supabase → Connect → Session pooler URI
+      - key: FRONTEND_URL
+        sync: false # https://<your-project>.vercel.app
+      - key: ALLOWED_ORIGINS
+        sync: false # same as FRONTEND_URL (comma-separate several)
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false # https://plateletiq-api.onrender.com/api/v1/auth/google/callback
+
+# Optional integrations — add in the dashboard or sync from Doppler:
+#   UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
+#   QSTASH_TOKEN, QSTASH_CURRENT_SIGNING_KEY, QSTASH_NEXT_SIGNING_KEY
+#   PUSHER_APP_ID, PUSHER_KEY, PUSHER_SECRET, PUSHER_CLUSTER
+#   GMAIL_SENDER, GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN
+#   BREVO_API_KEY, BREVO_SENDER_EMAIL, RESEND_API_KEY
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET
+#   DISCORD_WEBHOOK_URL
+#   SENTRY_DSN, BETTERSTACK_SOURCE_TOKEN, BETTERSTACK_INGESTING_HOST
+#   HEARTBEAT_URL_EXPIRY_SWEEP, HEARTBEAT_URL_DAILY_DIGEST, HEARTBEAT_URL_FORECAST_REFRESH
+#   STATUS_PAGE_URL
+#   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+#   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+#   AWS_SNS_CUSTODY_TOPIC_ARN, AWS_SNS_ALERTS_TOPIC_ARN, AWS_S3_BUCKET, AWS_SES_SENDER

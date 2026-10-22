@@ -102,20 +102,53 @@ def _osrm_route(o_lat: float, o_lng: float, d_lat: float, d_lng: float) -> Dict[
     }
 
 
-def get_route(o_lat: float, o_lng: float, d_lat: float, d_lng: float) -> Dict[str, Any]:
-    """Best available road route between two points."""
+ROUTE_CACHE_SECONDS = int(os.getenv("ROUTE_CACHE_SECONDS", "21600"))  # 6 h
+
+
+def get_route(o_lat: float, o_lng: float, d_lat: float, d_lng: float, use_cache: bool = True) -> Dict[str, Any]:
+    """
+    Best available road route between two points.
+
+    Real routes are cached in Upstash Redis for a few hours, keyed by the two
+    coordinates: the facility pairs in a city repeat constantly, and the
+    public OSRM server is a shared resource we should not hammer. A
+    straight-line fallback is never cached, so the next request retries the
+    real providers.
+    """
+    key = f"route:{o_lat:.5f},{o_lng:.5f}:{d_lat:.5f},{d_lng:.5f}:{'mb' if MAPBOX_ACCESS_TOKEN else 'osrm'}"
+    if use_cache:
+        try:
+            from cloud import cache
+
+            cached = cache.get_json(key)
+            if cached:
+                return {**cached, "cached": True}
+        except Exception:
+            pass
+
+    route = None
     if MAPBOX_ACCESS_TOKEN:
         try:
-            return _mapbox_route(o_lat, o_lng, d_lat, d_lng)
+            route = _mapbox_route(o_lat, o_lng, d_lat, d_lng)
         except Exception as exc:
             print(f"Mapbox directions unavailable, trying OSRM: {exc}")
 
-    try:
-        return _osrm_route(o_lat, o_lng, d_lat, d_lng)
-    except Exception as exc:
-        print(f"OSRM unavailable, using straight-line estimate: {exc}")
+    if route is None:
+        try:
+            route = _osrm_route(o_lat, o_lng, d_lat, d_lng)
+        except Exception as exc:
+            print(f"OSRM unavailable, using straight-line estimate: {exc}")
 
-    return _straight_line_route(o_lat, o_lng, d_lat, d_lng)
+    if route is None:
+        return _straight_line_route(o_lat, o_lng, d_lat, d_lng)
+
+    try:
+        from cloud import cache
+
+        cache.set_json(key, route, ttl=ROUTE_CACHE_SECONDS)
+    except Exception:
+        pass
+    return route
 
 
 # ── Geometry helpers used by the live tracking view ──────────────────────────

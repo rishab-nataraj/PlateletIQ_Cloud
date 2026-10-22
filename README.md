@@ -4,8 +4,9 @@
 
 PlateletIQ forecasts platelet demand per hospital, and when a shortage is coming, moves units from a facility that has them — with custody verified by one-time code at both ends, a booked courier, and a live map.
 
-> DSU DevHack 3.0 · Healthcare + AI/ML
+> DSU DevHack 3.0 · Healthcare + AI/ML · extended for Cloud Architecture Design
 > 20 eRaktKosh-registered blood centres across Chennai
+> **35 managed cloud services, all on free tiers** — see [docs/CLOUD_SERVICES.md](docs/CLOUD_SERVICES.md)
 
 ---
 
@@ -34,6 +35,34 @@ PlateletIQ is the missing workflow.
 **Moves the units** — a transfer reserves real inventory rows nearest-expiry-first, books a courier, and settles onto the receiving facility's ledger only when the receiver redeems the sender's code.
 
 **Tracks the shipment** — road-routed map, courier marker, and a scan-by-scan timeline, visible to both facilities from one source of truth.
+
+---
+
+## Cloud architecture
+
+The console and API run as separate cloud services, and everything around a
+transfer — telling the right people, keeping an independent record, watching for
+failure — runs on managed services, each on a free tier.
+
+| Layer | Services |
+|---|---|
+| Hosting | **Vercel** (console + Web Analytics + Speed Insights), **Render** (API, `render.yaml` blueprint) |
+| Data | **Supabase** PostgreSQL + Storage, **Upstash Redis** |
+| Messaging & schedules | **Upstash QStash** (queue with retries + dead-letter queue, cron), **Pusher Channels** (live updates) |
+| Notifications | Email via **Gmail API → Brevo → Resend → Amazon SES** (failover), **Telegram** bot, **Discord** ops channel, in-app inbox |
+| Compliance (AWS Free Tier) | **SNS → SQS (+DLQ) → Lambda → DynamoDB** hash-chained custody ledger, **EventBridge Scheduler** daily report, **S3** custody certificates, **IAM**, **CloudWatch**, **CloudFormation**, **Budgets** |
+| Observability | **Sentry**, **Better Stack** logs + heartbeats, **UptimeRobot** + status page |
+| Security & delivery | **Google Identity**, **Doppler** secrets, **GitHub Actions** CI, **Docker** |
+
+Every integration is switched on by environment variables and degrades
+gracefully when absent. The console's **Cloud services** screen shows each one's
+live status — computed by the running API, with a **Test** button — and the
+**Notifications** screen shows exactly how every alert was delivered.
+
+- [docs/CLOUD_SERVICES.md](docs/CLOUD_SERVICES.md) — every service: role, free tier, AWS equivalent, where in the code
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — creating the free accounts, step by step
+- [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md) — a 12-minute walkthrough
+- [aws/README.md](aws/README.md) — the AWS stack, deployable from one CloudFormation file
 
 ---
 
@@ -121,16 +150,23 @@ Worth trying: have B attempt step 4, or A attempt step 8. Both get a plain 403.
 ## Architecture
 
 ```
-  React 19 + Vite            FastAPI + SQLAlchemy           External
-  ───────────────            ────────────────────           ────────
-  Facility picker  ─────►    /auth/select-facility
-  Transfers        ─────►    /transfers/*          ─────►   Shiprocket (courier)
-  Live tracking    ─────►    /transfers/{id}/track ─────►   Mapbox │ OSRM (routing)
-  Forecast         ─────►    /forecast/*                    OpenStreetMap (tiles)
-                             LASSO model (joblib)
-                             SQLite │ PostgreSQL
-                                   ▲
-                             /webhooks/shiprocket ◄─────    courier scans
+  Vercel                      Render                          External
+  React 19 + Vite             FastAPI + SQLAlchemy
+  ───────────────             ────────────────────            ────────
+  Facility picker  ─────►     /auth/select-facility   ◄────   Google Identity
+  Transfers        ─────►     /transfers/*            ─────►  Shiprocket (courier)
+  Live tracking    ─────►     /transfers/{id}/track   ─────►  Mapbox │ OSRM (routing, cached in Upstash Redis)
+  Forecast         ─────►     /forecast/*             ─────►  Supabase Storage (uploaded history)
+  Notifications    ─────►     /notifications/*                LASSO model (joblib)
+  Cloud services   ─────►     /system/*  /jobs/*              Supabase PostgreSQL
+        ▲                          │   ▲
+        │ Pusher (private channel) │   │ QStash: queued delivery + cron (signed)
+        └──────────────────────────┤   └───────────────
+                                   ├──► Email (Gmail API → Brevo → Resend → SES) · Telegram · Discord
+                                   ├──► AWS: SNS → SQS → Lambda → DynamoDB ledger · S3 certificates
+                                   └──► Sentry · Better Stack · (UptimeRobot watches /health)
+                             /webhooks/shiprocket ◄─────   courier scans
+                             /webhooks/telegram   ◄─────   bot messages
 ```
 
 **Auth is two-stage.** Google establishes identity; the JWT carries **no facility**. A second screen binds the session to a registered facility and re-issues the token with `bank_id`. Every stock-touching endpoint reads the facility off the token — so two browsers running one build are two different hospitals purely because each chose differently. There is no ambient default facility; an unbound session gets a 403 telling it to choose.
@@ -154,6 +190,8 @@ Judges deserve this plainly.
 | Facility coordinates | Curated from public addresses. eRaktKosh does not publish lat/long; optional Nominatim geocoding is built in. |
 | Demand model | Trained on the Aachen hospital dataset (2008–2018, 4,018 days), calibrated with a WHO India monthly index. It is **not** trained on Chennai data — the adapter reports its own limitations through `/analytics/model-health`. |
 | Opening inventory | Seeded, deterministic per facility. Real operation would ingest from the facility's LIS. |
+| Cloud integrations | **Real when configured.** Each is switched on by environment variables; the Cloud services screen shows which are live right now, and its Test buttons make real round trips. Unconfigured ones say *Not configured* and a fallback runs. |
+| Notifications | **Real.** Delivered per channel with status, provider and error recorded; never contain custody codes. |
 
 `GET /api/v1/health` reports which integrations are genuinely configured, so nothing has to be taken on trust.
 
@@ -172,18 +210,20 @@ Measured on the training dataset's holdout, not on Chennai operations. The adapt
 
 ## Tech stack
 
-**Frontend** — React 19, TypeScript, Vite 8, Tailwind 4, TanStack Query 5, Recharts, Leaflet
-**Backend** — Python, FastAPI, Pydantic v2, SQLAlchemy 2.0, Uvicorn
+**Frontend** — React 19, TypeScript, Vite 8, Tailwind 4, TanStack Query 5, Recharts, Leaflet, pusher-js, Sentry
+**Backend** — Python, FastAPI, Pydantic v2, SQLAlchemy 2, Uvicorn, psycopg 3, boto3
 **ML** — scikit-learn LASSO quantile pipeline
 **Logistics** — Shiprocket API; Mapbox Directions or OSRM
 **Auth** — Google Identity Services → facility binding, HS256 JWT
-**Data** — SQLite locally, PostgreSQL in production
+**Data** — SQLite locally, Supabase PostgreSQL in the cloud
+**Cloud** — Vercel, Render, Supabase, Upstash (Redis, QStash), Pusher, Gmail API / Brevo / Resend, Telegram, Discord, Sentry, Better Stack, UptimeRobot, Doppler, GitHub Actions, Docker, AWS (SNS, SQS, Lambda, DynamoDB, EventBridge Scheduler, S3, SES, IAM, CloudWatch, CloudFormation, Budgets)
 
 ---
 
 ## Configuration
 
-`backend/.env.example` documents every setting. The ones that matter:
+`backend/.env.example` documents every setting, including every cloud
+integration (all optional — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)). The core ones:
 
 | Variable | Why |
 |---|---|
@@ -194,13 +234,15 @@ Measured on the training dataset's holdout, not on Chennai operations. The adapt
 | `SHIPROCKET_WEBHOOK_TOKEN` | Webhook intake is **refused entirely** until set. |
 | `MAPBOX_ACCESS_TOKEN` | Traffic-aware routing; OSRM is used without it. |
 | `ALLOWED_ORIGINS` | Add the LAN address to run the two consoles on two machines. |
+| `DATABASE_URL` | Supabase session-pooler URI in the cloud; SQLite locally. |
+| `JOBS_SECRET` | Lets GitHub Actions / curl trigger scheduled jobs. |
 
 ---
 
 ## Known limitations
 
 - Opening inventory is seeded; there is no LIS ingestion yet.
-- Consoles poll every 2.5s rather than using websockets — fine at this scale, not at national scale.
+- Without Pusher configured, consoles poll every 2.5s; with it, changes are pushed and polling is a 20s safety net.
 - The forecast model is trained on German data; Indian seasonality is applied as a calibration index, not learned.
 - One backend serves both facilities. A real deployment would federate per-facility instances behind a registry.
 - Cold-chain temperature is an instruction to the courier, not telemetry. No IoT sensor is integrated, and the UI does not claim one.
@@ -211,15 +253,25 @@ Measured on the training dataset's holdout, not on Chennai operations. The adapt
 
 ```
 backend/
+  cloud/          one adapter per cloud service: email · telegram · discord · realtime (Pusher)
+                  qstash · cache (Upstash Redis) · storage (Supabase) · aws · observability · registry
   routers/        auth · facilities · transfers · webhooks · forecast · inventory
+                  notifications · jobs · system · realtime
   services/       otp · inventory_ledger · routing · courier_tracking · facility_registry
+                  notifications · transfer_notifications · jobs · custody_stream · certificate_service
   services/transport/   shiprocket · porter · beckn · internal (one interface)
-  models/         SQLAlchemy schema
+  models/         SQLAlchemy schema (+ notifications, deliveries, telegram links, job runs)
+  tests/          pytest: notification pipeline, signatures, jobs, realtime auth, Telegram, ledger stream
 frontend/src/
-  screens/        LoginScreen · FacilitySelectScreen · TransfersScreen · TransferTrackingScreen
-  components/     RouteMap (Leaflet) · OtpPanels
+  screens/        Login · FacilitySelect · Transfers · TransferTracking · Notifications · CloudServices
+  contexts/       AuthContext · LiveContext (Pusher, toasts, browser notifications)
+  components/     RouteMap (Leaflet) · OtpPanels · LiveWidgets
   api/            typed client, dynamic facility scoping
-docs/TRANSFERS.md the transfer pipeline in detail
+aws/              CloudFormation stack, Lambda sources, moto tests
+docs/             TRANSFERS · CLOUD_SERVICES · DEPLOYMENT · DEMO_SCRIPT
+scripts/          QStash schedules · Telegram webhook · Gmail token · env bootstrap
+render.yaml       Render blueprint          doppler.yaml   Doppler secrets
+docker-compose.yml  Postgres + API + console  .github/workflows/  CI · run a job
 start.bat / start.sh
 ```
 

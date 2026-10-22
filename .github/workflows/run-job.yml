@@ -1,0 +1,36 @@
+# Run a scheduled job on demand — the backup scheduler.
+#
+# Normally Upstash QStash triggers the jobs. This workflow calls the same
+# endpoint with the JOBS_SECRET header, so a job can be run from the GitHub
+# Actions tab (or on a cron, by uncommenting `schedule`) if QStash is not set up.
+#
+# Repository → Settings → Secrets and variables → Actions:
+#   secret   JOBS_SECRET   same value as the API's JOBS_SECRET
+#   variable API_URL       e.g. https://plateletiq-api.onrender.com
+name: Run a job
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Which job
+        type: choice
+        options: [expiry-sweep, daily-digest, forecast-refresh]
+        default: expiry-sweep
+  # schedule:
+  #   - cron: "5 * * * *"     # expiry-sweep hourly (UTC)
+  #   - cron: "30 2 * * *"    # daily-digest 08:00 IST
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake the API (Render free instances sleep after 15 min)
+        run: curl -fsS --retry 6 --retry-delay 15 --retry-all-errors "${{ vars.API_URL }}/api/v1/health" > /dev/null
+      - name: Run ${{ inputs.job || 'expiry-sweep' }}
+        run: |
+          JOB="${{ inputs.job || 'expiry-sweep' }}"
+          if [ "${{ github.event.schedule }}" = "30 2 * * *" ]; then JOB=daily-digest; fi
+          curl -fsS -X POST "${{ vars.API_URL }}/api/v1/jobs/$JOB" \
+            -H "X-Jobs-Secret: ${{ secrets.JOBS_SECRET }}" \
+            -H "X-Trigger: github-actions" | python3 -m json.tool

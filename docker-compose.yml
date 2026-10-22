@@ -1,0 +1,55 @@
+# Local, production-like stack: PostgreSQL (stands in for Supabase), the API,
+# and the console served by nginx.
+#
+#   docker compose up --build
+#   UI   http://localhost:8080      API  http://localhost:8000/api/v1/health
+#
+# Cloud integrations are read from backend/.env if it exists (all optional).
+name: plateletiq
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: plateletiq
+      POSTGRES_USER: plateletiq
+      POSTGRES_PASSWORD: plateletiq
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U plateletiq -d plateletiq"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: ./backend
+    env_file:
+      - path: backend/.env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://plateletiq:plateletiq@db:5432/plateletiq
+      FRONTEND_URL: http://localhost:8080
+      ALLOWED_ORIGINS: http://localhost:8080,http://127.0.0.1:8080
+      ALLOW_DEV_SIGNIN: "1"
+      JWT_SECRET: ${JWT_SECRET:-local-compose-jwt-secret-change-me}
+      OTP_SECRET: ${OTP_SECRET:-local-compose-otp-secret-change-me}
+      JOBS_SECRET: ${JOBS_SECRET:-local-compose-jobs-secret}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: http://localhost:8000/api/v1
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+
+volumes:
+  pgdata:

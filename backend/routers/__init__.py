@@ -10,6 +10,10 @@ from routers.camp import router as camp_router
 from routers.transport import transport_router
 from routers.webhooks import webhooks_router
 from routers.facilities import router as facilities_router
+from routers.notifications import router as notifications_router
+from routers.jobs import router as jobs_router
+from routers.system import router as system_router
+from routers.realtime import router as realtime_router
 
 __all__ = [
     "auth_router",
@@ -24,5 +28,9 @@ __all__ = [
     "transport_router",
     "webhooks_router",
     "facilities_router",
+    "notifications_router",
+    "jobs_router",
+    "system_router",
+    "realtime_router",
 ]
 

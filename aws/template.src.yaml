@@ -1,0 +1,460 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  PlateletIQ compliance stack (AWS Free Tier). Every custody event published by
+  the API goes SNS -> SQS (+DLQ) -> Lambda -> a hash-chained DynamoDB ledger.
+  EventBridge Scheduler runs a daily compliance report that re-verifies the
+  chains and e-mails a summary. S3 stores chain-of-custody certificates, SES is
+  an extra email provider, CloudWatch alarms watch the DLQ and the Lambdas, an
+  AWS Budget guards the bill, and IAM grants the API only what it needs.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Who gets alerts" }
+        Parameters: [AlertEmail]
+      - Label: { default: "Optional" }
+        Parameters: [SesSenderEmail, MonthlyBudgetUsd]
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: >-
+      Receives the daily compliance report, CloudWatch alarms and budget
+      warnings. AWS sends a confirmation email first - click the link in it.
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: Must be an email address.
+  SesSenderEmail:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional. An address to verify in Amazon SES so the API can send mail
+      through SES. Leave empty to skip SES.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Budget alarm threshold in USD. Alerts at 80% actual and 100% forecast.
+
+Conditions:
+  HasSesSender: !Not [!Equals [!Ref SesSenderEmail, ""]]
+
+Resources:
+  # ── Messaging: SNS fan-out into an SQS buffer with a dead-letter queue ──────
+  CustodyEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: plateletiq-custody-events
+      DisplayName: PlateletIQ custody events
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: plateletiq-alerts
+      DisplayName: PlateletIQ
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  AlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertsTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAlarmsAndBudgets
+            Effect: Allow
+            Principal:
+              Service: [cloudwatch.amazonaws.com, budgets.amazonaws.com]
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  LedgerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: plateletiq-custody-ledger-dlq
+      MessageRetentionPeriod: 1209600 # 14 days to investigate
+      SqsManagedSseEnabled: true
+
+  LedgerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: plateletiq-custody-ledger
+      VisibilityTimeout: 120 # 6x the Lambda timeout, as AWS recommends
+      MessageRetentionPeriod: 345600 # 4 days
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt LedgerDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  LedgerQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref LedgerQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCustodyTopic
+            Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt LedgerQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref CustodyEventsTopic
+
+  CustodyToLedgerSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CustodyEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt LedgerQueue.Arn
+      RawMessageDelivery: true
+
+  # ── Storage: the ledger table and the certificates bucket ──────────────────
+  LedgerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: plateletiq-custody-ledger
+      BillingMode: PROVISIONED # stays inside the always-free 25 RCU / 25 WCU
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: day, AttributeType: S }
+        - { AttributeName: ts, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 }
+      GlobalSecondaryIndexes:
+        - IndexName: ByDay # sparse: only ledger events carry `day`
+          KeySchema:
+            - { AttributeName: day, KeyType: HASH }
+            - { AttributeName: ts, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+          ProvisionedThroughput: { ReadCapacityUnits: 2, WriteCapacityUnits: 2 }
+
+  CertificatesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain # certificates are a compliance record
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub plateletiq-certificates-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+          - Id: clean-diagnostics
+            Status: Enabled
+            Prefix: diagnostics/
+            ExpirationInDays: 7
+
+  CertificatesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CertificatesBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt CertificatesBucket.Arn
+              - !Sub "${CertificatesBucket.Arn}/*"
+            Condition:
+              Bool: { aws:SecureTransport: "false" }
+
+  # ── Compute: the ledger writer and the daily report ────────────────────────
+  LedgerFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/plateletiq-custody-ledger
+      RetentionInDays: 14
+
+  LedgerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: custody-ledger
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${LedgerFunctionLogs.Arn}:*"
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+                Resource: !GetAtt LedgerQueue.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:ConditionCheckItem]
+                Resource: !GetAtt LedgerTable.Arn
+
+  LedgerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LedgerFunctionLogs
+    Properties:
+      FunctionName: plateletiq-custody-ledger
+      Description: Appends custody events to the hash-chained DynamoDB ledger
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 20
+      Role: !GetAtt LedgerFunctionRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref LedgerTable
+      Code:
+        ZipFile: |
+__LEDGER_CODE__
+
+  LedgerEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt LedgerQueue.Arn
+      FunctionName: !Ref LedgerFunction
+      BatchSize: 10
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  ReportFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/plateletiq-compliance-report
+      RetentionInDays: 14
+
+  ReportFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: compliance-report
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ReportFunctionLogs.Arn}:*"
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource:
+                  - !GetAtt LedgerTable.Arn
+                  - !Sub "${LedgerTable.Arn}/index/ByDay"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertsTopic
+
+  ReportFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ReportFunctionLogs
+    Properties:
+      FunctionName: plateletiq-compliance-report
+      Description: Daily custody summary with hash-chain verification
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt ReportFunctionRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref LedgerTable
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+      Code:
+        ZipFile: |
+__REPORT_CODE__
+
+  # ── Scheduling: EventBridge Scheduler, 08:00 India time ────────────────────
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-report
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ReportFunction.Arn
+
+  DailyReportSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: plateletiq-daily-compliance-report
+      Description: Custody ledger summary every morning
+      ScheduleExpression: cron(0 8 * * ? *)
+      ScheduleExpressionTimezone: Asia/Kolkata
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt ReportFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        RetryPolicy: { MaximumRetryAttempts: 2 }
+
+  # ── Monitoring: CloudWatch alarms -> alerts topic ──────────────────────────
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: plateletiq-custody-dlq-not-empty
+      AlarmDescription: A custody event failed 3 times and is parked in the DLQ.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt LedgerDeadLetterQueue.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  LedgerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: plateletiq-custody-ledger-errors
+      AlarmDescription: The ledger Lambda reported errors.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref LedgerFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+  ReportErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: plateletiq-compliance-report-errors
+      AlarmDescription: The daily compliance report failed.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ReportFunction }]
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+  # ── Cost guardrail ─────────────────────────────────────────────────────────
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: plateletiq-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUsd, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+
+  # ── Identity: what the PlateletIQ API may do, and nothing more ─────────────
+  SesSenderIdentity:
+    Type: AWS::SES::EmailIdentity
+    Condition: HasSesSender
+    Properties:
+      EmailIdentity: !Ref SesSenderEmail
+
+  BackendUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: plateletiq-backend
+      Policies:
+        - PolicyName: plateletiq-backend-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PublishCustodyEventsAndAlerts
+                Effect: Allow
+                Action: sns:Publish
+                Resource: [!Ref CustodyEventsTopic, !Ref AlertsTopic]
+              - Sid: WriteAndReadCertificates
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource:
+                  - !Sub "${CertificatesBucket.Arn}/certificates/*"
+                  - !Sub "${CertificatesBucket.Arn}/diagnostics/*"
+              - Sid: SendMailThroughSes
+                Effect: Allow
+                Action: [ses:SendEmail, ses:SendRawEmail]
+                Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+
+Outputs:
+  Region:
+    Value: !Ref AWS::Region
+  CustodyTopicArn:
+    Description: AWS_SNS_CUSTODY_TOPIC_ARN
+    Value: !Ref CustodyEventsTopic
+  AlertsTopicArn:
+    Description: AWS_SNS_ALERTS_TOPIC_ARN
+    Value: !Ref AlertsTopic
+  CertificatesBucketName:
+    Description: AWS_S3_BUCKET
+    Value: !Ref CertificatesBucket
+  LedgerTableName:
+    Value: !Ref LedgerTable
+  LedgerQueueUrl:
+    Value: !Ref LedgerQueue
+  DeadLetterQueueUrl:
+    Value: !Ref LedgerDeadLetterQueue
+  BackendUserName:
+    Description: Create an access key for this user (IAM console) and set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+    Value: !Ref BackendUser
+  ApiEnvironment:
+    Description: Paste into the API environment (Render / Doppler), together with the access key.
+    Value: !Sub >-
+      AWS_REGION=${AWS::Region}
+      AWS_SNS_CUSTODY_TOPIC_ARN=${CustodyEventsTopic}
+      AWS_SNS_ALERTS_TOPIC_ARN=${AlertsTopic}
+      AWS_S3_BUCKET=${CertificatesBucket}

@@ -1,11 +1,15 @@
 import { useCallback, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "../contexts/AuthContext";
+import { usePollInterval } from "../contexts/LiveContext";
 import { facilityApi, transferApi } from "../api/endpoints";
 import type { Counterparty, Transfer } from "../api/types";
 import { CodeEntry, IssuedCodeCard } from "../components/OtpPanels";
 
-/** How often each console re-reads the shared state. */
+/**
+ * How often each console re-reads the shared state when realtime is off.
+ * With Pusher connected, changes are pushed and this drops to a 20 s safety net.
+ */
 const POLL_INTERVAL_MS = 2500;
 
 /**
@@ -54,6 +58,7 @@ export default function TransfersScreen({ onViewTracking }: { onViewTracking?: (
   const { user } = useAuth();
   const queryClient = useQueryClient();
   const bankId = user?.bank_id ?? null;
+  const pollInterval = usePollInterval(POLL_INTERVAL_MS);
 
   const [composer, setComposer] = useState<"SHORTAGE_PULL" | "WASTAGE_PUSH" | null>(null);
   const [banner, setBanner] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
@@ -77,7 +82,7 @@ export default function TransfersScreen({ onViewTracking }: { onViewTracking?: (
   const { data: transfers, isLoading, error } = useQuery({
     queryKey: ["transfers", bankId],
     queryFn: () => transferApi.list("all"),
-    refetchInterval: POLL_INTERVAL_MS,
+    refetchInterval: pollInterval,
     enabled: Boolean(bankId),
   });
 
@@ -368,15 +373,18 @@ function TransferCard({
           )}
         </div>
 
-        {transfer.route_geometry && (
-          <button
-            onClick={() => onViewTracking?.(transfer.id)}
-            className="text-[13px] font-medium px-3.5 py-2 rounded-full cursor-pointer transition-colors"
-            style={{ background: "#F0F0F2", color: "#1D1D1F" }}
-          >
-            Track shipment
-          </button>
-        )}
+        <div className="flex flex-wrap gap-2">
+          {transfer.status === "TRANSFER_COMPLETED" && <CertificateButton transferId={transfer.id} />}
+          {transfer.route_geometry && (
+            <button
+              onClick={() => onViewTracking?.(transfer.id)}
+              className="text-[13px] font-medium px-3.5 py-2 rounded-full cursor-pointer transition-colors"
+              style={{ background: "#F0F0F2", color: "#1D1D1F" }}
+            >
+              Track shipment
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Logistics facts */}
@@ -853,6 +861,39 @@ function isFinished(transfer: Transfer): boolean {
 }
 
 /** True when the ball is in this console's court. */
+/**
+ * Opens the chain-of-custody certificate: an archived copy from S3 / Supabase
+ * Storage when one exists, otherwise a PDF the API renders on the spot.
+ */
+function CertificateButton({ transferId }: { transferId: string }) {
+  const [state, setState] = useState<"idle" | "loading" | "error">("idle");
+  async function open() {
+    // Open the tab synchronously so pop-up blockers allow it, then point it at the PDF.
+    const tab = window.open("about:blank", "_blank");
+    setState("loading");
+    try {
+      const url = await transferApi.certificate(transferId);
+      if (tab) tab.location.href = url;
+      else window.location.href = url;
+      setState("idle");
+    } catch {
+      tab?.close();
+      setState("error");
+    }
+  }
+  return (
+    <button
+      onClick={open}
+      disabled={state === "loading"}
+      className="text-[13px] font-medium px-3.5 py-2 rounded-full cursor-pointer transition-colors disabled:opacity-50"
+      style={{ background: "#E7F5EA", color: "#1A7431" }}
+      title="Chain-of-custody certificate (PDF)"
+    >
+      {state === "loading" ? "Preparing…" : state === "error" ? "Certificate unavailable" : "Custody certificate"}
+    </button>
+  );
+}
+
 function needsMyAction(transfer: Transfer): boolean {
   if (isFinished(transfer)) return false;
   const isSender = transfer.viewer_role === "SENDER";

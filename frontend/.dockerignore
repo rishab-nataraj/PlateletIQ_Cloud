@@ -1,0 +1,3 @@
+node_modules/
+dist/
+# Note: .figma/ must stay — vite.config.ts reads .figma/make/site.json.

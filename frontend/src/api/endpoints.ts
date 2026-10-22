@@ -1,9 +1,17 @@
 import { apiClient } from "./client";
 import type {
   AuthConfig,
+  ClientConfig,
   Counterparty,
   Facility,
+  IntegrationTestResult,
+  IntegrationsPayload,
+  JobRun,
+  JobsPayload,
+  NotificationItem,
+  NotificationSettings,
   SessionUser,
+  TelegramLinkInfo,
   TrackedTransfer,
   Transfer,
 } from "./types";
@@ -157,6 +165,49 @@ export const transferApi = {
   /** Receiver redeems the sender's receipt code. This settles both ledgers. */
   verifyDelivery: (id: string, otp: string): Promise<Transfer> =>
     unwrap(apiClient.post(`/transfers/${id}/delivery/verify`, { otp })),
+
+  /**
+   * The chain-of-custody certificate. Archived copies (S3 / Supabase) come back
+   * as a short-lived link; otherwise the API renders the PDF on the spot.
+   */
+  certificate: async (id: string): Promise<string> => {
+    const response = await apiClient.get(`/transfers/${id}/certificate`, { responseType: "blob" });
+    const blob = response.data as Blob;
+    if (blob.type === "application/pdf") return URL.createObjectURL(blob);
+    const payload = JSON.parse(await blob.text()) as { data: { url: string } };
+    return payload.data.url;
+  },
+};
+
+// ── Notifications ────────────────────────────────────────────────────────────
+
+export const notificationApi = {
+  list: (unreadOnly = false): Promise<NotificationItem[]> =>
+    unwrap(apiClient.get("/notifications", { params: { unread_only: unreadOnly, limit: 60 } })),
+  unreadCount: (): Promise<{ unread: number }> => unwrap(apiClient.get("/notifications/unread-count")),
+  markRead: (id: string) => unwrap(apiClient.post(`/notifications/${id}/read`)),
+  markAllRead: () => unwrap(apiClient.post("/notifications/read-all")),
+  getSettings: (): Promise<NotificationSettings> => unwrap(apiClient.get("/notifications/settings")),
+  updateSettings: (patch: Partial<NotificationSettings>): Promise<NotificationSettings> =>
+    unwrap(apiClient.put("/notifications/settings", patch)),
+  sendTest: (): Promise<NotificationItem[]> => unwrap(apiClient.post("/notifications/test")),
+  createTelegramLink: (): Promise<TelegramLinkInfo> => unwrap(apiClient.post("/notifications/telegram/link")),
+  telegramLinkStatus: (id: string): Promise<{ id: string; status: string; chat?: string; warning?: string }> =>
+    unwrap(apiClient.get(`/notifications/telegram/links/${id}`)),
+  revokeTelegramLink: (id: string) => unwrap(apiClient.delete(`/notifications/telegram/links/${id}`)),
+};
+
+// ── Cloud services & jobs ────────────────────────────────────────────────────
+
+export const systemApi = {
+  clientConfig: (): Promise<ClientConfig> => unwrap(apiClient.get("/system/client-config")),
+  integrations: (): Promise<IntegrationsPayload> => unwrap(apiClient.get("/system/integrations")),
+  test: (key: string): Promise<IntegrationTestResult> => unwrap(apiClient.post(`/system/test/${key}`)),
+};
+
+export const jobsApi = {
+  list: (): Promise<JobsPayload> => unwrap(apiClient.get("/jobs")),
+  runMine: (name: string): Promise<JobRun> => unwrap(apiClient.post(`/jobs/${name}/run-mine`)),
 };
 
 // ── Bank-scoped operational data ─────────────────────────────────────────────

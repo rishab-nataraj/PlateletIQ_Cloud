@@ -18,6 +18,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -39,6 +40,8 @@ from services.otp_service import (
 from services.routing import get_route
 from services.transport.base import TransportError
 from services.transport.factory import get_named_provider, get_transport_provider
+from services.notifications import background
+from services.transfer_notifications import broadcast_change, notify_transfer, settle_followup
 
 router = APIRouter(tags=["transfers"])
 
@@ -211,6 +214,11 @@ def _serialise(db: Session, transfer: Transfer, viewer_bank_id: str = None) -> D
         } if transfer.rider_name else None,
         "instructions": COLD_CHAIN_INSTRUCTIONS,
         "reserved_units": len(transfer.reserved_unit_ids),
+        "certificate": {
+            "available": transfer.status == "TRANSFER_COMPLETED",
+            "archived_in": transfer.certificate_store,
+            "sha256": transfer.certificate_sha256,
+        },
         # Never the codes themselves — only whether one is live and who owes it.
         "pickup_otp": {
             "issued": pickup_challenge is not None,
@@ -322,6 +330,7 @@ def create_transfer(
     _audit(db, current_user, caller_bank_id, f"OPEN_TRANSFER_{direction}", transfer.id)
     db.commit()
     db.refresh(transfer)
+    notify_transfer(db, transfer, "requested")
 
     return {"data": _serialise(db, transfer, caller_bank_id), "error": None}
 
@@ -423,6 +432,7 @@ def accept_transfer(
         )
         _audit(db, current_user, caller_bank_id, "TRANSFER_DISPATCH_FAILED", transfer.id)
         db.commit()
+        notify_transfer(db, transfer, "dispatch_failed")
         raise HTTPException(status_code=502, detail=f"Courier dispatch failed: {exc.message}")
 
     # Store the canonical key so this row always resolves back to the same
@@ -477,6 +487,7 @@ def accept_transfer(
     _audit(db, current_user, caller_bank_id, "ACCEPT_TRANSFER", transfer.id)
     db.commit()
     db.refresh(transfer)
+    notify_transfer(db, transfer, "accepted")
 
     payload = _serialise(db, transfer, caller_bank_id)
     # Returned exactly once, to the facility that issued it.
@@ -510,6 +521,7 @@ def decline_transfer(
     _audit(db, current_user, caller_bank_id, "DECLINE_TRANSFER", transfer.id)
     db.commit()
     db.refresh(transfer)
+    notify_transfer(db, transfer, "declined")
     return {"data": _serialise(db, transfer, caller_bank_id), "error": None}
 
 
@@ -549,6 +561,7 @@ def cancel_transfer(
     _audit(db, current_user, caller_bank_id, "CANCEL_TRANSFER", transfer.id)
     db.commit()
     db.refresh(transfer)
+    notify_transfer(db, transfer, "cancelled")
     return {"data": _serialise(db, transfer, caller_bank_id), "error": None}
 
 
@@ -582,6 +595,7 @@ def reissue_pickup_otp(
     _log_event(db, transfer, "PICKUP_OTP_REQUIRED", "Pickup code re-issued",
                "The previous pickup code was superseded.", actor_bank_id=caller_bank_id)
     db.commit()
+    broadcast_change(transfer)
 
     return {
         "data": {"transfer_id": transfer.id, "otp_code": code, "expires_at": expires_at.isoformat()},
@@ -650,6 +664,7 @@ def verify_pickup(
     _audit(db, current_user, caller_bank_id, "PICKUP_VERIFIED", transfer.id)
     db.commit()
     db.refresh(transfer)
+    notify_transfer(db, transfer, "picked_up")
 
     payload = _serialise(db, transfer, caller_bank_id)
     payload["delivery_otp_code"] = delivery_code
@@ -703,6 +718,7 @@ def reissue_delivery_otp(
     )
     _audit(db, current_user, caller_bank_id, "REISSUE_DELIVERY_OTP", transfer.id)
     db.commit()
+    broadcast_change(transfer)
 
     return {
         "data": {
@@ -779,6 +795,10 @@ def verify_delivery(
     _audit(db, current_user, caller_bank_id, "DELIVERY_VERIFIED_SETTLED", transfer.id)
     db.commit()
     db.refresh(transfer)
+    broadcast_change(transfer)
+    # Certificate (PDF -> S3 / Supabase Storage) and the "settled" alerts run
+    # off the request thread, so the receiver's console returns immediately.
+    background(settle_followup, transfer.id)
 
     payload = _serialise(db, transfer, caller_bank_id)
     payload["settlement"] = {
@@ -952,3 +972,36 @@ def transfer_events(
         ],
         "error": None,
     }
+
+
+@router.get("/transfers/{transfer_id}/certificate")
+def transfer_certificate(
+    transfer_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    The chain-of-custody certificate for a settled transfer.
+
+    Archived copies (S3 / Supabase Storage) come back as a fresh 15-minute
+    link; otherwise the PDF is rendered on the spot, so the certificate is
+    available even with no object storage configured.
+    """
+    caller_bank_id = _caller_bank_id(current_user)
+    transfer = _get_transfer(db, transfer_id)
+    _require_party(transfer, caller_bank_id)
+    if transfer.status != "TRANSFER_COMPLETED":
+        raise HTTPException(status_code=409, detail="A certificate is issued once the transfer has settled.")
+
+    from services.certificate_service import fresh_link, render
+
+    link = fresh_link(transfer)
+    if link:
+        return {"data": {"url": link, "archived_in": transfer.certificate_store}, "error": None}
+
+    pdf, _ = render(db, transfer)
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{transfer.id}-custody-certificate.pdf"'},
+    )

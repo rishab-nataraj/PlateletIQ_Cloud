@@ -7,10 +7,17 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 import datetime
 import time
 
+# Observability first, so anything that fails during import is captured.
+from cloud.observability import init_sentry, log_event, logger, setup_logging
+
+setup_logging()
+init_sentry()
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
+from cloud import cache
 from database import Base, SessionLocal, engine
 from migrations import ensure_schema
 from routers import (
@@ -20,13 +27,21 @@ from routers import (
     facilities_router,
     forecast_router,
     inventory_router,
+    jobs_router,
     network_router,
+    notifications_router,
+    realtime_router,
     recommendation_router,
     requisitions_router,
+    system_router,
     transfers_router,
     transport_router,
     webhooks_router,
 )
+from services import custody_stream
+
+# Every committed TransferEvent is mirrored to the AWS custody ledger (SNS).
+custody_stream.install(SessionLocal)
 
 API_PREFIX = "/api/v1"
 
@@ -36,8 +51,12 @@ app = FastAPI(
         "Platelet inventory, demand forecasting, and inter-facility transfer logistics "
         "for eRaktKosh-registered blood centres."
     ),
-    version="3.0.0",
+    version="4.0.0",
 )
+
+# Uptime monitors identify themselves; remembering when each last checked in
+# lets the Cloud services screen prove the monitor is really watching.
+MONITOR_AGENTS = {"uptimerobot": "uptimerobot", "betterstack": "better", "render": "render"}
 
 
 @app.middleware("http")
@@ -45,10 +64,21 @@ async def log_requests(request: Request, call_next):
     started = time.perf_counter()
     response = await call_next(request)
     elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
-    print(
-        f"[{datetime.datetime.utcnow().isoformat()}] "
-        f"{request.method} {request.url.path} -> {response.status_code} ({elapsed_ms}ms)"
-    )
+    path = request.url.path
+    if path.endswith("/health"):
+        agent = request.headers.get("user-agent", "").lower()
+        for name, marker in MONITOR_AGENTS.items():
+            if marker in agent:
+                cache.set_json(f"monitor:{name}:last", time.time(), ttl=7 * 24 * 3600)
+    # Polling endpoints would drown the log; everything else is one JSON line.
+    if not (request.method == "GET" and response.status_code < 400 and path.endswith(("/transfers", "/unread-count"))):
+        log_event(
+            "request",
+            method=request.method,
+            path=path,
+            status=response.status_code,
+            ms=elapsed_ms,
+        )
     return response
 
 
@@ -87,6 +117,10 @@ app.include_router(analytics_router, prefix=API_PREFIX)
 app.include_router(camp_router, prefix=API_PREFIX)
 app.include_router(transport_router, prefix=API_PREFIX)
 app.include_router(webhooks_router, prefix=API_PREFIX)
+app.include_router(notifications_router, prefix=API_PREFIX)
+app.include_router(jobs_router, prefix=API_PREFIX)
+app.include_router(system_router, prefix=API_PREFIX)
+app.include_router(realtime_router, prefix=API_PREFIX)
 
 
 @app.on_event("startup")
@@ -105,7 +139,7 @@ def startup() -> None:
         expired = mark_expired_units(db)
         init_default_config(db)
 
-        print(
+        logger.info(
             f"Registry ready: {facilities['created']} facility/facilities created, "
             f"{facilities['refreshed']} refreshed; "
             f"{inventory['units_created']} unit(s) seeded across "
@@ -115,10 +149,18 @@ def startup() -> None:
     except Exception as exc:
         # A seeding failure must be visible, not silent — an empty registry
         # means the facility picker comes up blank.
-        print(f"STARTUP ERROR while preparing the registry: {exc!r}")
+        logger.exception(f"STARTUP ERROR while preparing the registry: {exc!r}")
         raise
     finally:
         db.close()
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    """Let queued deliveries and ledger publishes finish before the process exits."""
+    from services.notifications import drain
+
+    drain(timeout=10)
 
 
 @app.get(f"{API_PREFIX}/health")
@@ -149,6 +191,9 @@ def health_check():
     transport_mode = os.getenv("TRANSPORT_MODE", "mock").lower()
     shiprocket_configured = bool(os.getenv("SHIPROCKET_EMAIL") and os.getenv("SHIPROCKET_PASSWORD"))
 
+    from cloud import email as email_service, qstash, realtime, telegram, discord, aws, storage
+    from cloud.observability import betterstack_status, sentry_status
+
     integrations = {
         # Says plainly whether courier calls hit Shiprocket or the simulator.
         "courier": "shiprocket_live" if (transport_mode == "live" and shiprocket_configured) else "simulated",
@@ -158,6 +203,19 @@ def health_check():
         "dev_signin": "enabled" if os.getenv("ALLOW_DEV_SIGNIN") == "1" else "disabled",
         "jwt_secret": "configured" if os.getenv("JWT_SECRET") else "ephemeral",
         "otp_secret": "configured" if os.getenv("OTP_SECRET") else "ephemeral",
+        "database_engine": engine.dialect.name,
+        "email": ",".join(email_service.provider_chain()) or "not_configured",
+        "queue": "qstash" if qstash.configured() else "inline",
+        "realtime": "pusher" if realtime.configured() else "polling",
+        "telegram": "enabled" if telegram.configured() else "not_configured",
+        "discord": "enabled" if discord.configured() else "not_configured",
+        "cache": cache.backend_name(),
+        "object_storage": ",".join(
+            name for name, on in (("s3", aws.s3_enabled()), ("supabase", storage.configured())) if on
+        ) or "not_configured",
+        "aws_custody_ledger": "enabled" if aws.sns_enabled() else "not_configured",
+        "sentry": "enabled" if sentry_status()["active"] else "not_configured",
+        "betterstack_logs": "enabled" if betterstack_status()["active"] else "not_configured",
     }
 
     healthy = checks["database"] == "ok" and checks["facilities_registered"] > 0

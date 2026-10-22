@@ -8,6 +8,13 @@ from models.audit import AuditLog
 from models.config import SystemConfig
 from models.otp import OTPChallenge
 from models.shipment import Shipment, TrackingEvent
+from models.notification import (
+    FacilityNotificationSettings,
+    JobRun,
+    Notification,
+    NotificationDelivery,
+    TelegramLink,
+)
 
 __all__ = [
     "Bank",
@@ -29,6 +36,11 @@ __all__ = [
     "OTPChallenge",
     "Shipment",
     "TrackingEvent",
+    "Notification",
+    "NotificationDelivery",
+    "FacilityNotificationSettings",
+    "TelegramLink",
+    "JobRun",
 ]
 
 
