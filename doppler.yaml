@@ -1,0 +1,17 @@
+# Doppler — one place for every secret, per environment.
+#
+#   doppler login
+#   doppler setup                 # reads this file: links backend/ and frontend/
+#   doppler secrets upload backend/.env --project plateletiq-api --config dev
+#   cd backend && doppler run -- uvicorn main:app --port 8000
+#
+# In the Doppler dashboard, Integrations → Render syncs plateletiq-api/prd to
+# the Render service, and Integrations → Vercel syncs plateletiq-web/prd to
+# the Vercel project, so production secrets are never typed into either host.
+setup:
+  - project: plateletiq-api
+    config: dev
+    path: backend/
+  - project: plateletiq-web
+    config: dev
+    path: frontend/

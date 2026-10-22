@@ -160,9 +160,11 @@ async def upload_history(
     Minimum 14 rows required.
     """
     rows = []
+    raw_upload, upload_type = None, None
 
     if file:
         content = await file.read()
+        raw_upload, upload_type = content, "text/csv"
         text = content.decode("utf-8")
         reader = csv.DictReader(io.StringIO(text))
         for i, row in enumerate(reader):
@@ -182,6 +184,7 @@ async def upload_history(
                 raise HTTPException(422, f"Row {i+1}: invalid data format — {e}")
 
     elif manual_data:
+        raw_upload, upload_type = manual_data.encode("utf-8"), "application/json"
         try:
             entries = json.loads(manual_data)
         except json.JSONDecodeError:
@@ -270,6 +273,20 @@ async def upload_history(
 
     db.commit()
 
+    # Keep the exact file the forecast was trained on (Supabase Storage), so
+    # every recommendation can be traced back to its input data.
+    archived = None
+    try:
+        from cloud import storage
+
+        if storage.configured() and raw_upload:
+            extension = "csv" if upload_type == "text/csv" else "json"
+            stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            stored = storage.upload(f"{bank_id}/demand-history/{stamp}-{run.id[:8]}.{extension}", raw_upload, upload_type)
+            archived = {"store": "supabase", "path": stored["path"]}
+    except Exception as exc:
+        print(f"Demand history not archived: {exc!r}")
+
     return {
         "data": {
             "run_id": run.id,
@@ -283,6 +300,7 @@ async def upload_history(
                 "drivers": dec["drivers"],
             },
             "message": "Forecast updated. Overview and Actions now reflect your data.",
+            "archived": archived,
         },
         "error": None,
     }

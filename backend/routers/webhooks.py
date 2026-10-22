@@ -22,9 +22,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from cloud.config import env
 from database import get_db
 from models.shipment import TrackingEvent
 from models.transfer import Transfer, TransferEvent
+from services.transfer_notifications import broadcast_change, notify_transfer
 
 webhooks_router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
@@ -204,6 +206,11 @@ async def shiprocket_webhook(request: Request, db: Session = Depends(get_db)):
     )
     db.commit()
 
+    if status_changed and transfer.status == "ARRIVED":
+        notify_transfer(db, transfer, "arrived")
+    else:
+        broadcast_change(transfer)
+
     return {
         "status": "ok",
         "matched": True,
@@ -211,3 +218,32 @@ async def shiprocket_webhook(request: Request, db: Session = Depends(get_db)):
         "transfer_status": transfer.status,
         "status_changed": status_changed,
     }
+
+
+# ── Telegram bot ─────────────────────────────────────────────────────────────
+
+@webhooks_router.post("/telegram")
+async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
+    """
+    Telegram delivers bot updates here (registered by
+    ``scripts/setup_telegram_webhook.py``). Telegram echoes the secret we
+    registered in ``X-Telegram-Bot-Api-Secret-Token``; anything without it is
+    refused, so nobody else can impersonate a chat linking to a facility.
+    """
+    secret = env("TELEGRAM_WEBHOOK_SECRET")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Telegram webhook is disabled: TELEGRAM_WEBHOOK_SECRET is not set.")
+    supplied = request.headers.get("x-telegram-bot-api-secret-token", "")
+    if not hmac.compare_digest(supplied, secret):
+        raise HTTPException(status_code=401, detail="Invalid Telegram secret token.")
+
+    from services.telegram_links import process_update
+
+    try:
+        update = json.loads((await request.body()) or b"{}")
+        process_update(db, update)
+    except Exception as exc:
+        # Always 200: a non-2xx makes Telegram redeliver the same update forever.
+        db.rollback()
+        print(f"Telegram update could not be processed: {exc!r}")
+    return {"ok": True}

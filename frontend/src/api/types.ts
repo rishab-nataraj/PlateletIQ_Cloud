@@ -105,6 +105,7 @@ export interface Transfer {
   rider: { name: string | null; mobile: string | null; vehicle: string | null } | null;
   instructions: string[];
   reserved_units: number;
+  certificate?: { available: boolean; archived_in: string | null; sha256: string | null };
   pickup_otp: OtpState;
   delivery_otp: OtpState;
   created_at: string | null;
@@ -151,4 +152,145 @@ export interface TimelineEntry {
 export interface TrackedTransfer extends Transfer {
   location: TrackedLocation;
   timeline: TimelineEntry[];
+}
+
+// ── Notifications ────────────────────────────────────────────────────────────
+
+export type Severity = "info" | "success" | "warning" | "critical";
+
+export interface NotificationDelivery {
+  id: string;
+  channel: "email" | "telegram" | "discord" | "realtime";
+  target: string | null;
+  status: "PENDING" | "SENT" | "FAILED" | "SKIPPED";
+  provider: string | null;
+  attempts: number;
+  error: string | null;
+  sent_at: string | null;
+}
+
+export interface NotificationItem {
+  id: string;
+  bank_id: string | null;
+  event_type: string;
+  severity: Severity;
+  title: string;
+  body: string | null;
+  transfer_id: string | null;
+  link: string | null;
+  details: [string, string | number][];
+  certificate_url: string | null;
+  dispatch_via: "qstash" | "inline" | null;
+  dispatch_status: string;
+  created_at: string | null;
+  read_at: string | null;
+  deliveries?: NotificationDelivery[];
+  /** Realtime-only test events are never stored. */
+  ephemeral?: boolean;
+}
+
+export interface NotificationSettings {
+  bank_id: string;
+  email_enabled: boolean;
+  telegram_enabled: boolean;
+  digest_enabled: boolean;
+  expiry_alerts_enabled: boolean;
+  extra_emails: string[];
+  email_recipients: string[];
+  telegram_chats: { id: string; label: string | null }[];
+  channels: {
+    email: { available: boolean; providers: string[] };
+    telegram: { available: boolean; bot: string | null };
+    realtime: { available: boolean };
+    discord: { available: boolean };
+    queue: { available: boolean; mode: "qstash" | "inline" };
+  };
+}
+
+export interface TelegramLinkInfo {
+  id: string;
+  code: string;
+  deep_link: string;
+  bot: string;
+  expires_in_minutes: number;
+  webhook: boolean;
+}
+
+// ── Cloud services ───────────────────────────────────────────────────────────
+
+export type IntegrationStatus = "live" | "fallback" | "off" | "build" | "frontend";
+
+export interface Integration {
+  key: string;
+  name: string;
+  category: string;
+  role: string;
+  status: IntegrationStatus;
+  detail: string;
+  free_tier: string;
+  aws_equivalent: string;
+  testable: boolean;
+  env: string[];
+  dashboard: string | null;
+}
+
+export interface IntegrationsPayload {
+  services: Integration[];
+  summary: Record<string, number>;
+  deliveries_24h: Record<string, Record<string, number>>;
+  queue: { mode: string; dead_letter_queue: number | null };
+  custody_stream: {
+    enabled: boolean;
+    published: number;
+    failed: number;
+    last_published_at: string | null;
+    last_error: string | null;
+  };
+  email_chain: string[];
+  environment: string;
+  release: string;
+}
+
+export interface IntegrationTestResult {
+  key: string;
+  ok: boolean;
+  elapsed_ms: number;
+  message: string;
+  id?: string;
+  url?: string;
+  latency_ms?: number;
+}
+
+export interface JobRun {
+  id: string;
+  job: string;
+  trigger: string;
+  scope: string;
+  status: "RUNNING" | "SUCCEEDED" | "FAILED";
+  started_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  summary: Record<string, unknown> | null;
+  error: string | null;
+}
+
+export interface JobsPayload {
+  jobs: {
+    name: string;
+    cron_utc: string;
+    description: string;
+    heartbeat: boolean;
+    scheduled_in_qstash: boolean;
+    last_run: JobRun | null;
+  }[];
+  recent_runs: JobRun[];
+  scheduler: string;
+}
+
+export interface ClientConfig {
+  realtime: { enabled: boolean; key?: string; cluster?: string };
+  telegram_bot: string | null;
+  environment: string;
+  release: string;
+  status_page_url: string | null;
 }

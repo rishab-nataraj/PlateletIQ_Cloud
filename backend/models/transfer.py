@@ -83,6 +83,11 @@ class Transfer(Base):
     # Monotonic counter — clients poll this to detect changes cheaply
     revision = Column(Integer, nullable=False, default=1)
 
+    # Chain-of-custody certificate, written when the transfer settles
+    certificate_store = Column(String, nullable=True)  # s3 | supabase
+    certificate_key = Column(String, nullable=True)
+    certificate_sha256 = Column(String, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     accepted_at = Column(DateTime, nullable=True)
     dispatched_at = Column(DateTime, nullable=True)

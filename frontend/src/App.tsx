@@ -1,6 +1,12 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { Analytics } from "@vercel/analytics/react";
+import { SpeedInsights } from "@vercel/speed-insights/react";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
+import { LiveProvider } from "./contexts/LiveContext";
+import { LiveStatus, ToastStack } from "./components/LiveWidgets";
+import NotificationsScreen from "./screens/NotificationsScreen";
+import CloudServicesScreen from "./screens/CloudServicesScreen";
 import LoginScreen from "./screens/LoginScreen";
 import FacilitySelectScreen from "./screens/FacilitySelectScreen";
 import OverviewScreen from "./screens/OverviewScreen";
@@ -27,7 +33,25 @@ const queryClient = new QueryClient({
 
 type Screen =
   | "overview" | "forecast" | "inventory" | "actions" | "analytics"
-  | "transfers" | "tracking" | "network" | "waste" | "camp" | "upload";
+  | "transfers" | "tracking" | "network" | "waste" | "camp" | "upload"
+  | "notifications" | "cloud";
+
+const SCREENS: Screen[] = [
+  "overview", "forecast", "inventory", "actions", "analytics", "transfers", "tracking",
+  "network", "waste", "camp", "upload", "notifications", "cloud",
+];
+
+/**
+ * Links in emails and Telegram messages open a specific screen:
+ * ``/?screen=transfers&transfer=TRF-1A2B3C4D``. Read once at load, before the
+ * sign-in flow rewrites the URL, and applied when a facility is bound.
+ */
+const initialParams = (() => {
+  if (typeof window === "undefined") return { screen: null as Screen | null, transfer: null as string | null };
+  const params = new URLSearchParams(window.location.search);
+  const screen = params.get("screen") as Screen | null;
+  return { screen: screen && SCREENS.includes(screen) ? screen : null, transfer: params.get("transfer") };
+})();
 
 const NAV_GROUPS: { label: string | null; items: { id: Screen; label: string }[] }[] = [
   {
@@ -56,12 +80,30 @@ const NAV_GROUPS: { label: string | null; items: { id: Screen; label: string }[]
       { id: "camp", label: "Camp planning" },
     ],
   },
+  {
+    label: "Cloud",
+    items: [
+      { id: "notifications", label: "Notifications" },
+      { id: "cloud", label: "Cloud services" },
+    ],
+  },
 ];
 
 function MainApp() {
   const { user, stage, isLoading, signOut, changeFacility } = useAuth();
   const [screen, setScreen] = useState<Screen>("overview");
   const [trackingId, setTrackingId] = useState<string | null>(null);
+  const deepLinkApplied = useRef(false);
+
+  useEffect(() => {
+    if (stage !== "facility" || deepLinkApplied.current) return;
+    deepLinkApplied.current = true;
+    if (initialParams.screen) {
+      if (initialParams.screen === "tracking" && initialParams.transfer) setTrackingId(initialParams.transfer);
+      setScreen(initialParams.screen);
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+  }, [stage]);
 
   if (isLoading) {
     return (
@@ -104,6 +146,8 @@ function MainApp() {
       case "waste": return <WasteRecoveryScreen />;
       case "camp": return <CampPlanningScreen />;
       case "upload": return <DataUploadScreen />;
+      case "notifications": return <NotificationsScreen onOpenTransfer={() => setScreen("transfers")} />;
+      case "cloud": return <CloudServicesScreen />;
     }
   }
 
@@ -203,11 +247,14 @@ function MainApp() {
           <span className="text-[#E5E5E7] font-light">·</span>
           {/* Build marker: if this is missing, an older copy of the UI is
               being served on this port. */}
-          <span className="text-[12px] text-[#AEAEB2]">Transfer pipeline v3</span>
+          <span className="text-[12px] text-[#AEAEB2]">Transfer pipeline v4 · cloud</span>
+          <LiveStatus onOpenInbox={() => setScreen("notifications")} />
         </div>
 
         <div className="flex-1 overflow-y-auto">{renderScreen()}</div>
       </div>
+
+      <ToastStack onOpen={(transferId) => setScreen(transferId ? "transfers" : "notifications")} />
     </div>
   );
 }
@@ -216,8 +263,13 @@ export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
-        <MainApp />
+        <LiveProvider>
+          <MainApp />
+        </LiveProvider>
       </AuthProvider>
+      {/* Vercel Web Analytics + Speed Insights: no-ops outside Vercel. */}
+      <Analytics />
+      <SpeedInsights />
     </QueryClientProvider>
   );
 }

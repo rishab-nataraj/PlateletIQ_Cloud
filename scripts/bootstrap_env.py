@@ -21,6 +21,8 @@ APP_ENV=development
 # Must stay stable across restarts, or sessions and live OTPs are invalidated.
 JWT_SECRET={jwt}
 OTP_SECRET={otp}
+# Lets curl / GitHub Actions trigger scheduled jobs (X-Jobs-Secret header).
+JOBS_SECRET={jobs}
 
 # Passwordless local sign-in. Turn this off anywhere real.
 ALLOW_DEV_SIGNIN=1
@@ -32,6 +34,9 @@ DATABASE_URL=sqlite:///./plateletiq.db
 
 # Add a LAN address here to run the two consoles on two machines.
 ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174
+
+# Cloud integrations are all optional and off by default. Copy the ones you
+# have set up from .env.example (docs/CLOUD_SERVICES.md explains each).
 """
 
 
@@ -42,7 +47,7 @@ def main() -> int:
 
     os.makedirs(BACKEND, exist_ok=True)
     with open(ENV_PATH, "w", encoding="utf-8") as handle:
-        handle.write(TEMPLATE.format(jwt=secrets.token_hex(32), otp=secrets.token_hex(32)))
+        handle.write(TEMPLATE.format(jwt=secrets.token_hex(32), otp=secrets.token_hex(32), jobs=secrets.token_hex(24)))
 
     print("Created backend/.env with freshly generated secrets.")
     return 0

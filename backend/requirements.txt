@@ -11,3 +11,13 @@ joblib>=1.3.0
 scikit-learn>=1.3.0
 pandas>=2.0.0
 numpy>=1.24.0
+
+# ── Cloud integrations (each optional at runtime; see docs/CLOUD_SERVICES.md)
+psycopg[binary]>=3.1.0        # Supabase / any PostgreSQL (psycopg 3)
+sentry-sdk[fastapi]>=2.0.0    # Sentry error tracking
+logtail-python>=0.3.0         # Better Stack log shipping
+upstash-redis>=1.1.0          # Upstash Redis (REST)
+qstash>=2.0.0                 # Upstash QStash queue + schedules
+pusher>=3.3.0                 # Pusher Channels realtime
+boto3>=1.34.0                 # AWS: SNS, S3, SES, STS
+fpdf2>=2.7.0                  # chain-of-custody PDF certificates

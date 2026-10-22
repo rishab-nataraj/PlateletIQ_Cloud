@@ -189,6 +189,11 @@ export default function DataUploadScreen() {
             <p className="text-[12px] text-[#6E6E73]">
               {result.recommendation?.reason_summary}
             </p>
+            {result.archived && (
+              <p className="text-[12px] text-[#1A7431] mt-3">
+                ✓ Source file archived in Supabase Storage: <span className="font-mono">{result.archived.path}</span>
+              </p>
+            )}
           </Card>
 
           {/* Sequential 5-Step Pipeline Reveal */}
